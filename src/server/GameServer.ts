@@ -12,6 +12,7 @@ import {
   ClientMessageSchema,
   ClientSendLiveStatsMessage,
   ClientSendWinnerMessage,
+  FEATURED_LOBBY_AUTO_START_MS,
   GameConfig,
   GameID,
   GameInfo,
@@ -20,6 +21,7 @@ import {
   HOSTED_LOBBY_AUTO_START_MS,
   Intent,
   LiveStats,
+  LobbyAccent,
   PlayerLiveStats,
   PlayerRecord,
   PublicGameType,
@@ -34,7 +36,11 @@ import {
   Tribe,
   Turn,
 } from "../core/Schemas";
-import { createPartialGameRecord, simpleHash } from "../core/Util";
+import {
+  createPartialGameRecord,
+  sanitizeLobbyLabel,
+  simpleHash,
+} from "../core/Util";
 import { archive, finalizeGameRecord } from "./Archive";
 import { Client } from "./Client";
 import { ClientMsgRateLimiter } from "./ClientMsgRateLimiter";
@@ -171,6 +177,14 @@ export class GameServer {
   // When the lobby was listed; drives the auto-start deadline. Cleared on
   // delist, so relisting starts a fresh deadline.
   private listedAt?: number;
+
+  // Featured lobbies: a label shown instead of the map name, an accent for the
+  // row, and a longer auto-start deadline. Set once at create_game by an
+  // authenticated admin bot; deliberately unreachable from update_game_config,
+  // like `listed` itself.
+  private label?: string;
+  private accent?: LobbyAccent;
+  private featured = false;
 
   private lobbyInfoIntervalId: ReturnType<typeof setInterval> | null = null;
 
@@ -333,13 +347,49 @@ export class GameServer {
   }
 
   // Whether `viewer` should see `target`'s real identity: when names aren't
-  // anonymized, when looking at themselves, or when the host granted the
-  // viewer reveal access (nameReveals).
-  private seesReal(viewer: ClientID | undefined, target: ClientID): boolean {
+  // Teammates in a matchmade game. Anonymizing a player from their own team makes
+  // the team unplayable — you cannot coordinate with someone you cannot identify —
+  // so a pinned team sees itself, exactly as a player already sees themselves.
+  // Only PINNED teams: those are assigned server-side, so the server knows them
+  // here. A team game that groups by clanTag/friends is resolved on the clients,
+  // and the server has no answer to give.
+  private sameMatchmadeTeam(
+    viewer: ClientID | undefined,
+    target: ClientID,
+  ): boolean {
+    if (viewer === undefined) return false;
+    const viewerClient = this.allClients.get(viewer);
+    const targetClient = this.allClients.get(target);
+    if (viewerClient === undefined || targetClient === undefined) return false;
+    const viewerTeam = this.matchmakingTeamIndex(viewerClient);
+    return (
+      viewerTeam !== undefined &&
+      viewerTeam === this.matchmakingTeamIndex(targetClient)
+    );
+  }
+
+  // The reveal reasons that predate teammate visibility: names are not
+  // anonymized at all, the viewer is looking at themselves, or the host granted
+  // reveal access (nameReveals). Split out because these carry the FULL identity,
+  // while a teammate reveal is deliberately narrower — see gameInfo.
+  private seesRealBeyondTeam(
+    viewer: ClientID | undefined,
+    target: ClientID,
+  ): boolean {
     return (
       !this.gameConfig.anonymizeNames ||
       target === viewer ||
       this.viewerSeesAllNames(viewer)
+    );
+  }
+
+  // Whether the viewer should see the target's real identity: names aren't
+  // anonymized, when looking at themselves, when on the same pinned team, or when
+  // the host granted the viewer reveal access (nameReveals).
+  private seesReal(viewer: ClientID | undefined, target: ClientID): boolean {
+    return (
+      this.seesRealBeyondTeam(viewer, target) ||
+      this.sameMatchmadeTeam(viewer, target)
     );
   }
 
@@ -1028,6 +1078,7 @@ export class GameServer {
     this.activeClients = this.activeClients.filter(
       (c) => c.clientID !== client.clientID,
     );
+    this.checkWinnerAfterElectorateShrink();
 
     // hasStarted() includes prestart: during the lobby -> game transition
     // clients reconnect, and a host socket closing then must not tear the
@@ -1526,7 +1577,13 @@ export class GameServer {
         alive.push(client);
       }
     }
+    // On an abrupt network drop the ws 'close' event can lag far behind this
+    // ping prune, so re-check the winner vote here too.
+    const pruned = alive.length < this.activeClients.length;
     this.activeClients = alive;
+    if (pruned) {
+      this.checkWinnerAfterElectorateShrink();
+    }
     if (now > this.createdAt + this.maxGameDuration) {
       this.log.warn("game past max duration", {
         gameID: this.id,
@@ -1564,21 +1621,31 @@ export class GameServer {
     const hideClanTags = this.gameConfig.disableClanTags ?? false;
     return {
       gameID: this.id,
-      clients: this.activeClients.map((c) =>
-        this.seesReal(viewer, c.clientID)
-          ? {
-              username: c.username,
-              clanTag: hideClanTags ? null : (c.clanTag ?? null),
-              clientID: c.clientID,
-              friends: friendsFor(c),
-              verified: c.cosmetics?.verified,
-            }
-          : {
-              username: this.anonName(viewer, c.clientID),
-              clanTag: null,
-              clientID: c.clientID,
-            },
-      ),
+      clients: this.activeClients.map((c) => {
+        if (!this.seesReal(viewer, c.clientID)) {
+          return {
+            username: this.anonName(viewer, c.clientID),
+            clanTag: null,
+            clientID: c.clientID,
+          };
+        }
+        // A TEAMMATE reveal is deliberately narrower than the others. Seeing a
+        // teammate's clanTag and friends would hand out more than the identity
+        // needed to coordinate: `friends` in particular names a THIRD party —
+        // the viewer would learn their teammate is friends with a specific
+        // still-anonymized opponent, which the host never granted. The wider
+        // reveals (self, or host-granted nameReveals) keep the full payload.
+        const teammateOnly =
+          this.gameConfig.anonymizeNames &&
+          !this.seesRealBeyondTeam(viewer, c.clientID);
+        return {
+          username: c.username,
+          clanTag: teammateOnly || hideClanTags ? null : (c.clanTag ?? null),
+          clientID: c.clientID,
+          friends: teammateOnly ? undefined : friendsFor(c),
+          verified: c.cosmetics?.verified,
+        };
+      }),
       lobbyCreatorClientID: this.lobbyCreatorID,
       gameConfig: this.gameConfig,
       startsAt: this.startsAt,
@@ -1586,6 +1653,9 @@ export class GameServer {
       publicGameType: this.publicGameType,
       listed: this.isPublic() ? undefined : this.listed,
       autoStartAt: this.autoStartAt(),
+      label: this.label,
+      accent: this.accent,
+      featured: this.featured ? true : undefined,
     };
   }
 
@@ -1626,9 +1696,34 @@ export class GameServer {
   // Deadline after which a listed lobby starts automatically, so hosts
   // can't sit on a public listing indefinitely.
   public autoStartAt(): number | undefined {
-    return this.listed && this.listedAt !== undefined
-      ? this.listedAt + HOSTED_LOBBY_AUTO_START_MS
-      : undefined;
+    if (!this.listed || this.listedAt === undefined) return undefined;
+    return (
+      this.listedAt +
+      (this.featured
+        ? FEATURED_LOBBY_AUTO_START_MS
+        : HOSTED_LOBBY_AUTO_START_MS)
+    );
+  }
+
+  public isFeatured(): boolean {
+    return this.featured;
+  }
+
+  public lobbyLabel(): string | undefined {
+    return this.label;
+  }
+
+  public lobbyAccent(): LobbyAccent | undefined {
+    return this.accent;
+  }
+
+  // Only create_game calls this. A label is sanitised at the boundary so no
+  // unsanitised text can exist on a GameServer at all.
+  public setFeatured(opts: { label?: string; accent?: LobbyAccent }): void {
+    this.featured = true;
+    const label = opts.label ? sanitizeLobbyLabel(opts.label) : "";
+    this.label = label.length > 0 ? label : undefined;
+    this.accent = opts.accent;
   }
 
   // Called from GameManager's tick while in the Lobby phase: once the
@@ -1947,6 +2042,29 @@ export class GameServer {
       {
         winnerKey,
       },
+    );
+    this.archiveGame();
+  }
+
+  // Votes are otherwise only tallied when one arrives (handleWinner), so a
+  // vote stuck short of a majority would never resolve once the rest of the
+  // electorate is gone. In a 1v1 the loser often disconnects within a second
+  // of being eliminated — before their own client simulates the win tick and
+  // votes — leaving the winner's vote wedged at 1 of 2 and the game archived
+  // winnerless (e.g. game s5bcKtj8). Re-tally whenever the electorate
+  // shrinks, counting only votes from still-active IPs (see resultAmong).
+  private checkWinnerAfterElectorateShrink() {
+    if (this.winner !== null || this._hasEnded) {
+      return;
+    }
+    const activeIPs = new Set(this.activeClients.map((c) => c.ip));
+    const result = this.winnerVotes.resultAmong(activeIPs);
+    if (result === null) {
+      return;
+    }
+    this.winner = result.value;
+    this.log.info(
+      `Winner determined by ${result.votes}/${activeIPs.size} active IPs after electorate shrank`,
     );
     this.archiveGame();
   }
