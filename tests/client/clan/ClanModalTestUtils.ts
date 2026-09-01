@@ -45,6 +45,12 @@ export function clanApiMockFactory() {
     promoteMember: vi.fn(),
     demoteMember: vi.fn(),
     transferLeadership: vi.fn(),
+    fetchClanDonations: vi.fn(async () => ({
+      results: [],
+      total: 0,
+      page: 1,
+      limit: 10,
+    })),
     fetchClanRequests: vi.fn(async () => ({
       results: [],
       total: 0,
@@ -70,6 +76,7 @@ export function clanApiMockFactory() {
     // ClanDetailView calls this when a clan has a discordUrl; mock the degraded
     // plain-link result so view tests never reach the real Discord network.
     fetchDiscordInvite: vi.fn(async (url: string) => ({ url, valid: true })),
+    donateToClan: vi.fn(async () => true),
   };
 }
 
@@ -93,6 +100,8 @@ export function apiMockFactory() {
       user: { email: "test@test.com" },
     })),
     invalidateUserMe: vi.fn(),
+    // ClanMapView derives the map page origin from the audience.
+    getAudience: vi.fn(() => "openfront.dev"),
   };
 }
 

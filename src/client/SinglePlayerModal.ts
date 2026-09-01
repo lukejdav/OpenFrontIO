@@ -15,7 +15,7 @@ import {
 } from "../core/game/Game";
 import { TeamCountConfig } from "../core/Schemas";
 import { generateID } from "../core/Util";
-import { hasLinkedAccount } from "./Api";
+import { responseHasLinkedIdentity } from "./AccountIdentity";
 import "./components/baseComponents/Button";
 import "./components/baseComponents/Modal";
 import { BaseModal } from "./components/BaseModal";
@@ -26,6 +26,7 @@ import { modalHeader } from "./components/ui/ModalHeader";
 import { getPlayerCosmetics } from "./Cosmetics";
 import { crazyGamesSDK } from "./CrazyGamesSDK";
 import { JoinLobbyEvent } from "./Main";
+import { fallbackPlayerName } from "./PlayerName";
 import { UsernameInput } from "./UsernameInput";
 import {
   getBotsForCompactMap,
@@ -65,6 +66,8 @@ const DEFAULT_OPTIONS = {
   waterNukes: false,
   doomsdayClock: false,
   doomsdayClockSpeed: "normal" as DoomsdayClockSpeed,
+  overtime: false,
+  overtimeStartMinutes: undefined as number | undefined,
 } as const;
 
 // A map earns achievements only if it has nations to conquer — the same rule
@@ -153,6 +156,9 @@ export class SinglePlayerModal extends BaseModal {
   @state() private doomsdayClock: boolean = DEFAULT_OPTIONS.doomsdayClock;
   @state() private doomsdayClockSpeed: DoomsdayClockSpeed =
     DEFAULT_OPTIONS.doomsdayClockSpeed;
+  @state() private overtime: boolean = DEFAULT_OPTIONS.overtime;
+  @state() private overtimeStartMinutes: number | undefined =
+    DEFAULT_OPTIONS.overtimeStartMinutes;
 
   private mapLoader = terrainMapFileLoader;
 
@@ -259,7 +265,7 @@ export class SinglePlayerModal extends BaseModal {
       title: translateText("main.solo") || "Solo",
       onBack: () => this.close(),
       ariaLabel: translateText("common.back"),
-      rightContent: hasLinkedAccount(this.userMeResponse)
+      rightContent: responseHasLinkedIdentity(this.userMeResponse)
         ? html`<button
               @click=${this.toggleAchievements}
               class="flex items-center gap-2 px-3 py-2 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 transition-all shrink-0 ${this
@@ -394,6 +400,21 @@ export class SinglePlayerModal extends BaseModal {
         .onInput=${this.handleCustomAllianceMinutesInput}
         .onKeyDown=${this.handleCustomAllianceMinutesKeyDown}
       ></toggle-input-card>`,
+      html`<toggle-input-card
+        .labelKey=${"game_settings.overtime"}
+        .checked=${this.overtime}
+        .inputMin=${1}
+        .inputMax=${120}
+        .inputStep=${1}
+        .inputValue=${this.overtimeStartMinutes}
+        .inputAriaLabel=${translateText("game_settings.overtime")}
+        .inputPlaceholder=${translateText("game_settings.mins_placeholder")}
+        .defaultInputValue=${30}
+        .minValidOnEnable=${1}
+        .onToggle=${this.handleOvertimeToggle}
+        .onInput=${this.handleOvertimeMinutesInput}
+        .onKeyDown=${this.handleOvertimeMinutesKeyDown}
+      ></toggle-input-card>`,
     ];
 
     return html`
@@ -488,7 +509,8 @@ export class SinglePlayerModal extends BaseModal {
 
         <!-- Footer Action -->
         <div class="p-6 border-t border-white/10 bg-black/20 shrink-0">
-          ${hasLinkedAccount(this.userMeResponse) && this.hasOptionsChanged()
+          ${responseHasLinkedIdentity(this.userMeResponse) &&
+          this.hasOptionsChanged()
             ? html`<div
                 class="mb-4 px-4 py-3 rounded-xl bg-yellow-500/20 border border-yellow-500/30 text-yellow-400 text-xs font-bold uppercase tracking-wider text-center"
               >
@@ -528,6 +550,7 @@ export class SinglePlayerModal extends BaseModal {
       // Pace only matters when the mode is on (startGame drops it when off).
       (this.doomsdayClock &&
         this.doomsdayClockSpeed !== DEFAULT_OPTIONS.doomsdayClockSpeed) ||
+      this.overtime !== DEFAULT_OPTIONS.overtime ||
       this.disabledUnits.length > 0
     );
   }
@@ -559,6 +582,8 @@ export class SinglePlayerModal extends BaseModal {
     this.waterNukes = DEFAULT_OPTIONS.waterNukes;
     this.doomsdayClock = DEFAULT_OPTIONS.doomsdayClock;
     this.doomsdayClockSpeed = DEFAULT_OPTIONS.doomsdayClockSpeed;
+    this.overtime = DEFAULT_OPTIONS.overtime;
+    this.overtimeStartMinutes = DEFAULT_OPTIONS.overtimeStartMinutes;
   }
 
   protected onOpen(): void {
@@ -714,6 +739,31 @@ export class SinglePlayerModal extends BaseModal {
     this.customAllianceMinutes = toOptionalNumber(value);
   };
 
+  private handleOvertimeToggle = (
+    checked: boolean,
+    value: number | string | undefined,
+  ) => {
+    this.overtime = checked;
+    this.overtimeStartMinutes = toOptionalNumber(value);
+  };
+
+  private handleOvertimeMinutesKeyDown = (e: KeyboardEvent) => {
+    preventDisallowedKeys(e, ["-", "+", "e"]);
+  };
+
+  private handleOvertimeMinutesInput = (e: Event) => {
+    const input = e.target as HTMLInputElement;
+    const value = parseBoundedIntegerFromInput(input, {
+      min: 1,
+      max: 120,
+      stripPattern: /[e+-]/gi,
+    });
+    if (value === undefined) {
+      return;
+    }
+    this.overtimeStartMinutes = value;
+  };
+
   private handleCustomAllianceMinutesKeyDown = (e: KeyboardEvent) => {
     preventDisallowedKeys(e, ["-", "+", "e"]);
   };
@@ -830,6 +880,8 @@ export class SinglePlayerModal extends BaseModal {
     // getUsername(), so a fast single-player start uses the Steam persona
     // rather than the interim generated anon name. Always resolves.
     await usernameInput?.whenSeeded();
+    // Name and badge from one resolution, as on the multiplayer join path.
+    const resolvedName = usernameInput?.resolvedName() ?? fallbackPlayerName();
 
     await crazyGamesSDK.requestMidgameAd();
 
@@ -842,9 +894,11 @@ export class SinglePlayerModal extends BaseModal {
             players: [
               {
                 clientID,
-                username: usernameInput.getUsername(),
-                clanTag: usernameInput.getClanTag() ?? null,
-                cosmetics: await getPlayerCosmetics(),
+                username: resolvedName.name,
+                clanTag: usernameInput?.getClanTag() ?? null,
+                cosmetics: await getPlayerCosmetics({
+                  verified: resolvedName.verified,
+                }),
               },
             ],
             config: {
@@ -890,6 +944,14 @@ export class SinglePlayerModal extends BaseModal {
                     doomsdayClock: {
                       enabled: true,
                       speed: this.doomsdayClockSpeed,
+                    },
+                  }
+                : {}),
+              ...(this.overtime
+                ? {
+                    overtime: {
+                      enabled: true,
+                      startMinutes: this.overtimeStartMinutes ?? 30,
                     },
                   }
                 : {}),

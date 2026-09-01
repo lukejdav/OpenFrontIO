@@ -4,8 +4,13 @@ import { Subscription } from "../../core/CosmeticSchemas";
 import { ResolvedCosmetic, translateCosmetic } from "../Cosmetics";
 import { translateText } from "../Utils";
 import "./CosmeticInfo";
-import { cosmeticDisplayName, cosmeticRarity } from "./CosmeticPresentation";
+import {
+  cosmeticDisplayName,
+  cosmeticRarity,
+  cosmeticSelectionLabel,
+} from "./CosmeticPresentation";
 import "./CosmeticPreview";
+import "./CosmeticPreviewBubble";
 
 const COSMETIC_CARD_STYLE_ID = "cosmetic-card-styles";
 if (!document.getElementById(COSMETIC_CARD_STYLE_ID)) {
@@ -380,14 +385,10 @@ export class CosmeticCard extends LitElement {
     } ${this.rarityHoverClass(rarity)}`;
     const priced = active.cosmetic as {
       artist?: string;
-      product?: unknown;
       priceHard?: number;
     } | null;
     const usdValue =
-      (priced?.product === null || priced?.product === undefined) &&
-      priced?.priceHard !== undefined
-        ? priced.priceHard / 20
-        : undefined;
+      priced?.priceHard !== undefined ? priced.priceHard / 20 : undefined;
     // A subscription lists its perks as text, which wraps to more lines than a
     // square box holds once cards are phone-width — let it take the height it
     // needs rather than clipping the last perk.
@@ -483,13 +484,17 @@ export class CosmeticCard extends LitElement {
             </div>`}
         ${this.interactive && active.cosmetic !== null
           ? html`<cosmetic-info
-              .artist=${priced?.artist}
-              .rarity=${rarity}
-              .colorPalette=${active.colorPalette?.name}
-              .showAdFree=${active.relationship === "purchasable"}
-              .usdValue=${usdValue}
-              .perks=${this.subscriptionPerks()}
-            ></cosmetic-info>`
+                .artist=${priced?.artist}
+                .rarity=${rarity}
+                .colorPalette=${active.colorPalette?.name}
+                .showAdFree=${active.relationship === "purchasable"}
+                .usdValue=${usdValue}
+                .perks=${this.subscriptionPerks()}
+                .items=${(active.packItems ?? []).map(cosmeticSelectionLabel)}
+              ></cosmetic-info>
+              <cosmetic-preview-bubble
+                .resolved=${active}
+              ></cosmetic-preview-bubble>`
           : nothing}
       </div>
       ${this.renderSwatches()}

@@ -20,6 +20,8 @@ import {
   PostTribeNameResponseSchema,
   PublicPlayerGamesResponse,
   PublicPlayerGamesResponseSchema,
+  PurchasePackResponse,
+  PurchasePackResponseSchema,
   PutUsernameResponse,
   PutUsernameResponseSchema,
   RankedLeaderboardResponse,
@@ -331,10 +333,16 @@ export type UpdateUsernameResult =
   | { ok: false; code: "failed" };
 
 // PUT /users/@me/username — renames the account username. Every failure is
-// atomic (no name change, no cooldown consumed). Both 409 bodies ("name
-// exclusively held" and "suffix space exhausted") map to "taken": the user
-// remedy is the same — pick another name. Invalidates the cached /users/@me
-// on success so the next read reflects the new name.
+// atomic (no name change, no cooldown consumed). The surviving 409 bodies
+// ("name equals an existing public id" and "suffix space exhausted") map to
+// "taken": the user remedy is the same — pick another name. Invalidates the
+// cached /users/@me on success so the next read reflects the new name.
+//
+// A premium player whose chosen bare name is already held no longer 409s: the
+// API grants the suffixed form and returns 200 with `bareClaim:
+// "unavailable"`. That is a real rename and it consumes the cooldown, so `ok:
+// true` alone is not enough to act on — callers must read `data.bareClaim`
+// and tell the player (see UsernamePanel).
 export async function updateUsername(
   username: string,
 ): Promise<UpdateUsernameResult> {
@@ -647,6 +655,101 @@ export async function purchaseWithCurrency(
   }
 }
 
+export type PurchaseCosmeticPackResult =
+  | { ok: true; data: PurchasePackResponse }
+  // 400 "Insufficient balance": the balance moved since the client's
+  // pre-check. Nothing charged.
+  | { ok: false; code: "insufficient_balance" }
+  // 400 insufficient_balance_debt: a refund/chargeback left the wallet
+  // negative; `debt` (bigint string) must be settled before anything is
+  // spendable. Nothing charged.
+  | { ok: false; code: "debt"; debt: string }
+  // 400 for a stale listing: pack not found / not for sale / zero price /
+  // all items deleted.
+  | { ok: false; code: "unavailable" }
+  // 409: the player already owns one or more items (`ownedFlareNames` says
+  // which). Also what a retry after a timed-out success returns — treat it as
+  // "already bought" and refetch /users/@me. Nothing charged.
+  | { ok: false; code: "already_owned"; ownedFlareNames: string[] }
+  | { ok: false; code: "failed" };
+
+const PACK_UNAVAILABLE_REASONS = [
+  "Pack not found",
+  "Pack is not for sale",
+  "Pack not available for hard currency",
+  "Pack has no items",
+  // A pattern item predating pack colours; an admin has to pick one.
+  "Pack item is missing its color palette",
+];
+
+// POST /shop/purchase/pack — buy a cosmetic pack (see CosmeticPackSchema) for
+// its hard-currency price, granting every item's flare in one transaction.
+// Any error means no debit and no grants.
+export async function purchaseCosmeticPack(
+  packName: string,
+): Promise<PurchaseCosmeticPackResult> {
+  try {
+    const response = await fetch(`${getApiBase()}/shop/purchase/pack`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: await getAuthHeader(),
+      },
+      body: JSON.stringify({ packName }),
+    });
+    if (response.status === 401) {
+      await logOut();
+      return { ok: false, code: "failed" };
+    }
+    if (response.status === 400) {
+      const body = await response.json().catch(() => null);
+      const reason = typeof body?.reason === "string" ? body.reason : "";
+      if (reason === "Insufficient balance") {
+        return { ok: false, code: "insufficient_balance" };
+      }
+      if (reason === "insufficient_balance_debt") {
+        return { ok: false, code: "debt", debt: String(body.debt ?? "") };
+      }
+      if (PACK_UNAVAILABLE_REASONS.includes(reason)) {
+        return { ok: false, code: "unavailable" };
+      }
+      console.error("purchaseCosmeticPack: bad request", body);
+      return { ok: false, code: "failed" };
+    }
+    if (response.status === 409) {
+      const body = await response.json().catch(() => null);
+      const owned: unknown = body?.ownedFlareNames;
+      return {
+        ok: false,
+        code: "already_owned",
+        ownedFlareNames: Array.isArray(owned)
+          ? owned.filter((f): f is string => typeof f === "string")
+          : [],
+      };
+    }
+    if (!response.ok) {
+      console.error(
+        "purchaseCosmeticPack: request failed",
+        response.status,
+        response.statusText,
+      );
+      return { ok: false, code: "failed" };
+    }
+    const parsed = PurchasePackResponseSchema.safeParse(await response.json());
+    if (!parsed.success) {
+      console.error(
+        "purchaseCosmeticPack: Zod validation failed",
+        parsed.error,
+      );
+      return { ok: false, code: "failed" };
+    }
+    return { ok: true, data: parsed.data };
+  } catch (e) {
+    console.error("purchaseCosmeticPack: request failed", e);
+    return { ok: false, code: "failed" };
+  }
+}
+
 // POST /rewards/:rewardId/claim — claims a single unclaimed reward and
 // credits the balance atomically. "not_found" covers unknown, already-claimed
 // and other players' rewards (indistinguishable by design); the usual cause is
@@ -902,7 +1005,7 @@ export async function openSubscriptionPortal(): Promise<string | false> {
 export async function fetchLobbyListed(gameID: string): Promise<boolean> {
   try {
     const res = await fetch(
-      `/${ClientEnv.workerPath(gameID)}/api/game/${gameID}`,
+      `${ClientEnv.serverHttpBase()}/${ClientEnv.workerPath(gameID)}/api/game/${gameID}`,
       { headers: { Accept: "application/json" } },
     );
     if (!res.ok) return false;
@@ -926,7 +1029,7 @@ export async function setLobbyListed(
   try {
     const token = await getPlayToken();
     const response = await fetch(
-      `/${ClientEnv.workerPath(gameID)}/api/game/${gameID}/listing`,
+      `${ClientEnv.serverHttpBase()}/${ClientEnv.workerPath(gameID)}/api/game/${gameID}/listing`,
       {
         method: "POST",
         headers: {
@@ -950,6 +1053,42 @@ export async function setLobbyListed(
   }
 }
 
+// POST /api/create_game on the game server — mints a fresh private lobby with
+// the caller as creator. Deliberately has no worker prefix and no id: the edge
+// (nginx in prod, the vite dev proxy locally) picks a worker, which mints a
+// self-owned id and returns it.
+export async function createLobby(): Promise<GameInfo> {
+  // Send JWT token for creator identification - server extracts persistentID from it
+  // persistentID should never be exposed to other clients
+  const token = await getPlayToken();
+  try {
+    const response = await fetch(
+      `${ClientEnv.serverHttpBase()}/api/create_game`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+      },
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("Server error response:", errorText);
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+    console.log("Success:", data);
+
+    return data as GameInfo;
+  } catch (error) {
+    console.error("Error creating lobby:", error);
+    throw error;
+  }
+}
+
 // POST /wX/api/create_game?previous=<gameID>, targeted at the worker that owns
 // the finished game — mints a successor private lobby (same creator, default
 // settings) and has the old game broadcast the new id to everyone still
@@ -960,7 +1099,7 @@ export async function createNextLobby(
 ): Promise<GameInfo> {
   const token = await getPlayToken();
   const response = await fetch(
-    `/${ClientEnv.workerPath(previousGameID)}/api/create_game?previous=${previousGameID}`,
+    `${ClientEnv.serverHttpBase()}/${ClientEnv.workerPath(previousGameID)}/api/create_game?previous=${previousGameID}`,
     {
       method: "POST",
       headers: {
@@ -995,18 +1134,6 @@ export function getAudience() {
   // Sourced from BOOTSTRAP_CONFIG (server/desktop-injected) rather than
   // window.location, so the desktop app (app://openfront) targets real infra.
   return ClientEnv.jwtAudience();
-}
-
-// Check if the user's account is linked to a Discord, Google, or email account.
-export function hasLinkedAccount(
-  userMeResponse: UserMeResponse | false,
-): boolean {
-  return (
-    userMeResponse !== false &&
-    (userMeResponse.user?.discord !== undefined ||
-      userMeResponse.user?.google !== undefined ||
-      userMeResponse.user?.email !== undefined)
-  );
 }
 
 export async function fetchGameById(

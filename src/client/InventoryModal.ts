@@ -1,5 +1,5 @@
 import type { TemplateResult } from "lit";
-import { html } from "lit";
+import { html, nothing } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import Countries from "resources/countries.json" with { type: "json" };
 import { UserMeResponse } from "../core/ApiSchemas";
@@ -15,6 +15,7 @@ import {
   CROWN_KEY,
   EFFECTS_KEY,
   FLAG_KEY,
+  MAX_LOADOUTS,
   PATTERN_KEY,
   USER_SETTINGS_CHANGED_EVENT,
   UserSettings,
@@ -29,12 +30,14 @@ import {
   cosmeticDisplayName,
   cosmeticSelectionLabel,
 } from "./components/CosmeticPresentation";
+import "./components/CosmeticPreviewModal";
 import "./components/EffectsGrid";
 import "./components/InventoryLoadoutBar";
 import type {
   InventoryCategory,
   InventoryLoadoutEntry,
 } from "./components/InventoryLoadoutBar";
+import "./components/InventoryLoadoutMenu";
 import { modalHeader } from "./components/ui/ModalHeader";
 import {
   fetchCosmetics,
@@ -68,6 +71,7 @@ export class InventoryModal extends BaseModal {
   @state() private isLoading = false;
   @state() private loadFailed = false;
   @state() private ownershipState: OwnershipState = "loading";
+  @state() private previewingCosmetic: ResolvedCosmetic | null = null;
 
   private cosmetics: Cosmetics | null = null;
   private userSettings: UserSettings = new UserSettings();
@@ -109,9 +113,15 @@ export class InventoryModal extends BaseModal {
     void this.onUserMe((event as CustomEvent<UserMeResponse | false>).detail);
   };
 
+  private onOpenCosmeticPreview = (event: Event) => {
+    const customEvent = event as CustomEvent<ResolvedCosmetic>;
+    this.previewingCosmetic = customEvent.detail;
+  };
+
   connectedCallback() {
     super.connectedCallback();
     document.addEventListener("userMeResponse", this._onUserMe);
+    this.addEventListener("open-cosmetic-preview", this.onOpenCosmeticPreview);
     window.addEventListener(
       `${USER_SETTINGS_CHANGED_EVENT}:${PATTERN_KEY}`,
       this._onCosmeticSelected,
@@ -131,6 +141,10 @@ export class InventoryModal extends BaseModal {
   }
 
   disconnectedCallback() {
+    this.removeEventListener(
+      "open-cosmetic-preview",
+      this.onOpenCosmeticPreview,
+    );
     super.disconnectedCallback();
     document.removeEventListener("userMeResponse", this._onUserMe);
     window.removeEventListener(
@@ -374,6 +388,72 @@ export class InventoryModal extends BaseModal {
     ];
   }
 
+  /** Slot buttons read as a numbered row, so keep them in slot order. */
+  private loadoutNames(): string[] {
+    return this.userSettings
+      .getLoadouts()
+      .map((loadout) => loadout.name)
+      .sort();
+  }
+
+  private hasEquippedCosmetic(): boolean {
+    const current = this.userSettings.captureLoadout("");
+    return (
+      current.pattern !== null ||
+      current.flag !== null ||
+      current.crown !== null ||
+      Object.keys(current.effects).length > 0
+    );
+  }
+
+  private renderLoadoutMenu(): TemplateResult {
+    const names = this.loadoutNames();
+    return html`<inventory-loadout-menu
+      .names=${names}
+      .active=${this.userSettings.getActiveLoadout() ?? ""}
+      .canAdd=${names.length < MAX_LOADOUTS}
+      .canUnequip=${this.hasEquippedCosmetic()}
+      .onSelect=${(name: string) => this.applyLoadout(name)}
+      .onAdd=${() => this.addLoadout()}
+      .onDelete=${(name: string) => this.deleteLoadout(name)}
+      .onUnequipAll=${() => this.unequipAll()}
+    ></inventory-loadout-menu>`;
+  }
+
+  private applyLoadout(name: string) {
+    // Re-selecting the active slot would only re-equip what's already worn.
+    if (this.userSettings.getActiveLoadout() === name) return;
+    if (!this.userSettings.applyLoadout(name)) return;
+    this.showMessage(translateText("inventory.loadout_applied", { name }));
+    this.updateFromSettings();
+  }
+
+  private addLoadout() {
+    const added = this.userSettings.addLoadout();
+    if (added === null) {
+      this.showMessage(
+        translateText("inventory.loadout_limit", { count: MAX_LOADOUTS }),
+      );
+      return;
+    }
+    this.showMessage(
+      translateText("inventory.loadout_saved", { name: added.name }),
+    );
+    this.updateFromSettings();
+  }
+
+  private deleteLoadout(name: string) {
+    this.userSettings.deleteLoadout(name);
+    this.showMessage(translateText("inventory.loadout_deleted", { name }));
+    this.updateFromSettings();
+  }
+
+  private unequipAll() {
+    this.userSettings.unequipAll();
+    this.showMessage(translateText("inventory.unequipped_all"));
+    this.updateFromSettings();
+  }
+
   private renderEmptyState(category: "skins" | "crowns") {
     return html`<p
       data-inventory-empty=${category}
@@ -560,6 +640,14 @@ export class InventoryModal extends BaseModal {
           />
         </div>
       </div>
+      ${this.previewingCosmetic
+        ? html`<cosmetic-preview-modal
+            .resolved=${this.previewingCosmetic}
+            @close-preview=${() => {
+              this.previewingCosmetic = null;
+            }}
+          ></cosmetic-preview-modal>`
+        : nothing}
     `;
   }
 
@@ -628,6 +716,7 @@ export class InventoryModal extends BaseModal {
     }
     const category = tab as InventoryCategory;
     return html`
+      ${this.renderLoadoutMenu()}
       <inventory-loadout-bar
         .entries=${this.loadoutEntries()}
         .activeCategory=${category}
@@ -660,6 +749,13 @@ export class InventoryModal extends BaseModal {
   }
 
   protected onClose(): void {
+    this.search = "";
+    this.previewingCosmetic = null;
+  }
+
+  // A query typed for skins rarely matches anything in flags, so a stale
+  // search reads as an empty tab. Reset it whenever the category changes.
+  protected onTabEnter(_key: string): void {
     this.search = "";
   }
 
@@ -707,14 +803,17 @@ export class InventoryModal extends BaseModal {
   }
 
   private showSelectedPopup(resolved: ResolvedCosmetic) {
+    this.showMessage(
+      translateText("inventory.selected_cosmetic", {
+        name: cosmeticSelectionLabel(resolved),
+      }),
+    );
+  }
+
+  private showMessage(message: string) {
     window.dispatchEvent(
       new CustomEvent("show-message", {
-        detail: {
-          message: translateText("inventory.selected_cosmetic", {
-            name: cosmeticSelectionLabel(resolved),
-          }),
-          duration: 2000,
-        },
+        detail: { message, duration: 2000 },
       }),
     );
   }

@@ -1,27 +1,43 @@
 import { html, LitElement, nothing, type TemplateResult } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { ClientEnv } from "src/client/ClientEnv";
+import { UserMeResponse } from "../core/ApiSchemas";
 import {
   Duos,
   GameMapType,
   GameMode,
+  GameType,
   HumansVsNations,
   Quads,
   Trios,
 } from "../core/game/Game";
 import { PublicGameInfo, PublicGames } from "../core/Schemas";
+import { getDesktopSessionState } from "./Auth";
 import "./components/IOSAddToHomeScreenBanner";
+import {
+  canJoinTrustedLobby,
+  lobbyCard,
+  mapAspectRatios,
+  trustRequiredDialog,
+  viewerIsSignedIn,
+  viewerIsTrusted,
+} from "./components/LobbyCard";
+import { crazyGamesSDK } from "./CrazyGamesSDK";
+import {
+  isDesktopShell,
+  multiplayerAllowed,
+  multiplayerAllowedForSession,
+  type DesktopSessionState,
+  type DesktopUpdateState,
+} from "./DesktopShell";
 import { HostLobbyModal } from "./HostLobbyModal";
 import { JoinLobbyModal } from "./JoinLobbyModal";
 import { PublicLobbySocket } from "./LobbySocket";
 import { JoinLobbyEvent } from "./Main";
 import { SinglePlayerModal } from "./SinglePlayerModal";
-import { terrainMapFileLoader } from "./TerrainMapFileLoader";
 import { UsernameInput } from "./UsernameInput";
 import {
   calculateServerTimeOffset,
-  getMapName,
-  getModifierLabels,
   getSecondsUntilServerTimestamp,
   renderDuration,
   translateText,
@@ -29,11 +45,59 @@ import {
 
 const CARD_BG = "bg-surface";
 
+/**
+ * Whether a multiplayer entry point should refuse to act. Exported for tests
+ * and kept free of component state so the rule is checkable in isolation.
+ * A null state means that bridge is absent (the web build), so it gates
+ * nothing; either state alone is enough to block.
+ */
+export function shouldBlockMultiplayerAction(
+  update: DesktopUpdateState | null,
+  session: DesktopSessionState | null,
+): boolean {
+  if (update !== null && !multiplayerAllowed(update)) return true;
+  if (session !== null && !multiplayerAllowedForSession(session)) return true;
+  return false;
+}
+
+/**
+ * Whether the desktop gate applies to a given join at all. Single-player runs
+ * entirely in-client and a replay simulates from an archived record, so
+ * neither needs a session or an up-to-date build. getTurnstileToken in
+ * Main.ts exempts the same pair (alongside two conditions irrelevant here),
+ * and calls this so the two cannot drift. Exported for tests and kept free of
+ * component state, like shouldBlockMultiplayerAction above.
+ */
+export function joinIsGateable(lobby: JoinLobbyEvent): boolean {
+  return (
+    lobby.gameStartInfo?.config.gameType !== GameType.Singleplayer &&
+    lobby.gameRecord === undefined
+  );
+}
+
+/**
+ * The whole gate decision for one join, as a pure function so it is testable
+ * without mounting Main's client. Main adds only the shell check and the
+ * status-bar wiggle around it.
+ */
+export function shouldBlockDesktopJoin(
+  lobby: JoinLobbyEvent,
+  update: DesktopUpdateState | null,
+  session: DesktopSessionState | null,
+): boolean {
+  if (!joinIsGateable(lobby)) return false;
+  return shouldBlockMultiplayerAction(update, session);
+}
+
 @customElement("game-mode-selector")
 export class GameModeSelector extends LitElement {
   @state() private lobbies: PublicGames | null = null;
-  @state() private mapAspectRatios: Map<GameMapType, number> = new Map();
   @state() private inputValid: boolean = true;
+  @state() private desktopUpdateState: DesktopUpdateState | null = null;
+  @state() private viewerTrusted: boolean = false;
+  @state() private viewerSignedIn: boolean = false;
+  @state() private showTrustRequired: boolean = false;
+  @state() private desktopSessionState: DesktopSessionState | null = null;
   private serverTimeOffset: number = 0;
   private defaultLobbyTime: number = 0;
 
@@ -61,6 +125,18 @@ export class GameModeSelector extends LitElement {
       "username-validity-change",
       this.handleValidityChange,
     );
+    document.addEventListener(
+      "desktop-update-state",
+      this.onDesktopUpdateState,
+    );
+    document.addEventListener("userMeResponse", this.onUserMe);
+    if (isDesktopShell()) {
+      this.desktopSessionState = getDesktopSessionState();
+    }
+    document.addEventListener(
+      "desktop-session-state",
+      this.onDesktopSessionState,
+    );
     // Pick up the current value in case username-input validated before us.
     const usernameInput = document.querySelector(
       "username-input",
@@ -76,6 +152,15 @@ export class GameModeSelector extends LitElement {
       "username-validity-change",
       this.handleValidityChange,
     );
+    document.removeEventListener(
+      "desktop-update-state",
+      this.onDesktopUpdateState,
+    );
+    document.removeEventListener("userMeResponse", this.onUserMe);
+    document.removeEventListener(
+      "desktop-session-state",
+      this.onDesktopSessionState,
+    );
     super.disconnectedCallback();
   }
 
@@ -83,8 +168,47 @@ export class GameModeSelector extends LitElement {
     this.inputValid = (e as CustomEvent).detail?.isValid ?? true;
   };
 
+  private onDesktopUpdateState = (e: Event) => {
+    this.desktopUpdateState = (e as CustomEvent<DesktopUpdateState>).detail;
+  };
+
+  private onUserMe = (e: Event) => {
+    const me = (e as CustomEvent<UserMeResponse | false>).detail;
+    this.viewerSignedIn = viewerIsSignedIn(me);
+    this.viewerTrusted = viewerIsTrusted(me);
+    // A CrazyGames sign-in surfaces as a userMeResponse without a linked
+    // identity, so re-read the SDK profile alongside it.
+    if (crazyGamesSDK.isOnCrazyGames()) {
+      void crazyGamesSDK.getUserProfile().then((user) => {
+        if (user !== null) this.viewerSignedIn = true;
+      });
+    }
+  };
+
+  private onDesktopSessionState = (e: Event) => {
+    this.desktopSessionState = (e as CustomEvent<DesktopSessionState>).detail;
+  };
+
   public stop() {
     this.lobbySocket.stop();
+  }
+
+  /**
+   * Re-open the public-lobby socket after stop().
+   *
+   * connectedCallback() used to be the only caller of lobbySocket.start(),
+   * which was fine while every exit from a started game reloaded the page. It
+   * is not fine for an exit that leaves in place (openInvite, OPE-255): this
+   * element is never disconnected, so connectedCallback never runs again and
+   * the lobby list stayed frozen on whatever it last received.
+   *
+   * Safe to call when already running -- PublicLobbySocket.start() closes any
+   * existing socket before opening a new one -- but callers should still only
+   * use it to undo a stop(), since a needless reconnect drops the cached
+   * snapshot and re-primes the list from the server.
+   */
+  public start() {
+    this.lobbySocket.start();
   }
 
   private handleLobbiesUpdate(lobbies: PublicGames) {
@@ -99,26 +223,9 @@ export class GameModeSelector extends LitElement {
 
     const allGames = Object.values(lobbies.games ?? {}).flat();
     for (const game of allGames) {
-      const mapType = game.gameConfig?.gameMap as GameMapType;
-      if (mapType && !this.mapAspectRatios.has(mapType)) {
-        // New Map reference triggers Lit reactivity; placeholder ratio 1 lets
-        // has() guard against duplicate in-flight fetches.
-        this.mapAspectRatios = new Map(this.mapAspectRatios).set(mapType, 1);
-        terrainMapFileLoader
-          .getMapData(mapType)
-          .manifest()
-          .then((m: any) => {
-            if (m?.map?.width && m?.map?.height) {
-              this.mapAspectRatios = new Map(this.mapAspectRatios).set(
-                mapType,
-                m.map.width / m.map.height,
-              );
-            }
-          })
-          .catch((e) =>
-            console.error(`Failed to load manifest for ${mapType}`, e),
-          );
-      }
+      mapAspectRatios.ensure(game.gameConfig?.gameMap as GameMapType, () =>
+        this.requestUpdate(),
+      );
     }
   }
 
@@ -129,12 +236,20 @@ export class GameModeSelector extends LitElement {
 
     return html`
       <div class="flex flex-col gap-4 w-full px-4 sm:px-0 mx-auto pb-4 sm:pb-0">
-        <!-- Solo: mobile only, top -->
-        <div class="sm:hidden h-14">
+        <!-- Solo + detailed view: mobile only, top. The lobby browser is one
+             column wide, matching Join Lobby below it. -->
+        <div class="sm:hidden grid grid-cols-3 gap-4 h-14">
+          <div class="col-span-2">
+            ${this.renderSmallActionCard(
+              translateText("main.solo"),
+              this.openSinglePlayerModal,
+              "bg-malibu-blue hover:bg-aquarius active:bg-malibu-blue/80 hover:scale-y-105 hover:scale-x-[1.01]",
+            )}
+          </div>
           ${this.renderSmallActionCard(
-            translateText("main.solo"),
-            this.openSinglePlayerModal,
-            "bg-malibu-blue hover:bg-aquarius active:bg-malibu-blue/80 hover:scale-y-105 hover:scale-x-[1.01]",
+            translateText("main.detailed_view"),
+            this.openDetailedView,
+            "bg-surface hover:brightness-[1.08] active:brightness-[0.95] hover:scale-105 hover:shadow-[var(--shadow-action-card-hover)]",
           )}
         </div>
         <!-- Create/ranked/join: mobile only, below solo -->
@@ -143,17 +258,22 @@ export class GameModeSelector extends LitElement {
             translateText("main.create"),
             this.openHostLobby,
             "bg-surface hover:brightness-[1.08] active:brightness-[0.95] hover:scale-105 hover:shadow-[var(--shadow-action-card-hover)]",
+            undefined,
+            true,
           )}
           ${this.renderSmallActionCard(
             translateText("mode_selector.ranked_title"),
             this.openRankedMenu,
             "bg-surface hover:brightness-[1.08] active:brightness-[0.95] hover:scale-105 hover:shadow-[var(--shadow-action-card-hover)]",
+            undefined,
+            true,
           )}
           ${this.renderSmallActionCard(
             translateText("main.join"),
             this.openJoinLobby,
             "bg-surface hover:brightness-[1.08] active:brightness-[0.95] hover:scale-105 hover:shadow-[var(--shadow-action-card-hover)]",
             this.hostedLobbyCount(),
+            true,
           )}
         </div>
         <!-- iOS Add to Home Screen banner -->
@@ -210,12 +330,20 @@ export class GameModeSelector extends LitElement {
               </div>
             </div>`}
 
-        <!-- Solo: full width, desktop only -->
-        <div class="hidden sm:block h-14">
+        <!-- Solo + detailed view, desktop only. Solo spans two columns; the
+             lobby browser is one, the same width as Join Lobby below it. -->
+        <div class="hidden sm:grid grid-cols-3 gap-4 h-14">
+          <div class="col-span-2">
+            ${this.renderSmallActionCard(
+              translateText("main.solo"),
+              this.openSinglePlayerModal,
+              "bg-malibu-blue hover:bg-aquarius active:bg-malibu-blue/80 hover:scale-y-105 hover:scale-x-[1.01]",
+            )}
+          </div>
           ${this.renderSmallActionCard(
-            translateText("main.solo"),
-            this.openSinglePlayerModal,
-            "bg-malibu-blue hover:bg-aquarius active:bg-malibu-blue/80 hover:scale-y-105 hover:scale-x-[1.01]",
+            translateText("main.detailed_view"),
+            this.openDetailedView,
+            "bg-surface hover:brightness-[1.08] active:brightness-[0.95] hover:scale-105 hover:shadow-[var(--shadow-action-card-hover)]",
           )}
         </div>
         <!-- Bottom row: create + ranked + join (desktop only) -->
@@ -224,19 +352,30 @@ export class GameModeSelector extends LitElement {
             translateText("main.create"),
             this.openHostLobby,
             "bg-surface hover:brightness-[1.08] active:brightness-[0.95] hover:scale-105 hover:shadow-[var(--shadow-action-card-hover)]",
+            undefined,
+            true,
           )}
           ${this.renderSmallActionCard(
             translateText("mode_selector.ranked_title"),
             this.openRankedMenu,
             "bg-surface hover:brightness-[1.08] active:brightness-[0.95] hover:scale-105 hover:shadow-[var(--shadow-action-card-hover)]",
+            undefined,
+            true,
           )}
           ${this.renderSmallActionCard(
             translateText("main.join"),
             this.openJoinLobby,
             "bg-surface hover:brightness-[1.08] active:brightness-[0.95] hover:scale-105 hover:shadow-[var(--shadow-action-card-hover)]",
             this.hostedLobbyCount(),
+            true,
           )}
         </div>
+        ${this.showTrustRequired
+          ? trustRequiredDialog(
+              this.viewerSignedIn,
+              () => (this.showTrustRequired = false),
+            )
+          : nothing}
       </div>
     `;
   }
@@ -245,9 +384,45 @@ export class GameModeSelector extends LitElement {
     return this.renderLobbyCard(lobby, this.getLobbyTitle(lobby));
   }
 
+  /**
+   * Refuses the action and draws attention to the update bar. Returns true when
+   * the caller should stop.
+   *
+   * Deliberately NOT implemented with the `disabled` attribute the way
+   * renderSmallActionCard handles invalid input: a disabled control (and
+   * `pointer-events-none` alongside it) swallows the click, leaving nothing to
+   * trigger the wiggle. The button stays clickable and merely stops being
+   * actionable.
+   */
+  private blockedByUpdate(): boolean {
+    if (
+      !shouldBlockMultiplayerAction(
+        this.desktopUpdateState,
+        this.desktopSessionState,
+      )
+    )
+      return false;
+    // Optional-call the method rather than dispatching an event: the bar is a
+    // sibling custom element that may not have upgraded yet, and `?.wiggle?.()`
+    // degrades to a silent no-op in that case instead of firing an event with
+    // no listener.
+    (
+      document.querySelector("desktop-status-bar") as
+        | (HTMLElement & { wiggle?: () => void })
+        | null
+    )?.wiggle?.();
+    return true;
+  }
+
   private openRankedMenu = () => {
+    if (this.blockedByUpdate()) return;
     if (!this.validateUsername()) return;
     window.showPage?.("page-ranked");
+  };
+
+  private openDetailedView = () => {
+    if (!this.validateUsername()) return;
+    window.showPage?.("page-detailed-view");
   };
 
   private openSinglePlayerModal = () => {
@@ -258,11 +433,13 @@ export class GameModeSelector extends LitElement {
   };
 
   private openHostLobby = () => {
+    if (this.blockedByUpdate()) return;
     if (!this.validateUsername()) return;
     (document.querySelector("host-lobby-modal") as HostLobbyModal)?.open();
   };
 
   private openJoinLobby = () => {
+    if (this.blockedByUpdate()) return;
     if (!this.validateUsername()) return;
     (document.querySelector("join-lobby-modal") as JoinLobbyModal)?.open();
   };
@@ -278,15 +455,28 @@ export class GameModeSelector extends LitElement {
     onClick: () => void,
     bgClass: string = CARD_BG,
     badge?: number,
+    // Only the three multiplayer action cards (create/ranked/join) pass this;
+    // the solo card is never gated (see openSinglePlayerModal) and must never
+    // show as disabled here.
+    gated: boolean = false,
   ) {
+    const blocked =
+      gated &&
+      shouldBlockMultiplayerAction(
+        this.desktopUpdateState,
+        this.desktopSessionState,
+      );
     return html`
       <button
         @click=${onClick}
         ?disabled=${!this.inputValid}
+        aria-disabled=${blocked}
         class="relative flex items-center justify-center w-full h-full rounded-lg ${bgClass} transition-all duration-200 text-sm lg:text-base font-medium text-white uppercase tracking-wider text-center ${!this
           .inputValid
           ? "opacity-50 cursor-not-allowed pointer-events-none"
-          : ""}"
+          : blocked
+            ? "opacity-50 cursor-not-allowed"
+            : ""}"
       >
         ${title}
         ${badge
@@ -303,13 +493,6 @@ export class GameModeSelector extends LitElement {
     lobby: PublicGameInfo,
     titleContent: string | TemplateResult,
   ) {
-    const mapType = lobby.gameConfig!.gameMap as GameMapType;
-    const mapImageSrc = terrainMapFileLoader.getMapData(mapType).webpPath;
-    const aspectRatio = this.mapAspectRatios.get(mapType);
-    // Use object-contain for extreme aspect ratios (e.g. Amazon River ~20:1) so
-    // the full map is visible instead of being cropped by object-cover.
-    const useContain =
-      aspectRatio !== undefined && (aspectRatio > 4 || aspectRatio < 0.25);
     const timeRemaining = lobby.startsAt
       ? getSecondsUntilServerTimestamp(lobby.startsAt, this.serverTimeOffset)
       : undefined;
@@ -325,102 +508,32 @@ export class GameModeSelector extends LitElement {
       timeDisplayUppercase = true;
     }
 
-    const mapName = getMapName(lobby.gameConfig?.gameMap);
-
-    const modifierLabels = getModifierLabels(
-      lobby.gameConfig?.publicGameModifiers,
-      lobby.gameConfig?.doomsdayClock?.speed,
-    );
-    // Sort by length for visual consistency (shorter labels first)
-    if (modifierLabels.length > 1) {
-      modifierLabels.sort((a, b) => a.length - b.length);
-    }
-
-    return html`
-      <button
-        @click=${() => this.validateAndJoin(lobby)}
-        ?disabled=${!this.inputValid}
-        class="group relative w-full h-44 sm:h-full text-white uppercase rounded-2xl transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] bg-surface hover:shadow-[var(--shadow-lobby-card-hover)] ${!this
-          .inputValid
-          ? "opacity-50 cursor-not-allowed pointer-events-none"
-          : ""}"
-      >
-        <!-- Image clipped separately so overflow-hidden doesn't block absolute children -->
-        <div
-          class="absolute inset-0 rounded-2xl overflow-hidden pointer-events-none"
-        >
-          ${mapImageSrc
-            ? html`<img
-                src="${mapImageSrc}"
-                alt="${mapName ?? lobby.gameConfig?.gameMap ?? "map"}"
-                draggable="false"
-                class="absolute inset-0 w-full h-full ${useContain
-                  ? "object-contain"
-                  : "object-cover object-center scale-[1.05]"} [image-rendering:auto]"
-              />`
-            : null}
-        </div>
-        <!-- Top row: modifiers + timer -->
-        <div
-          class="absolute inset-x-2 top-2 flex items-start justify-between gap-2"
-        >
-          ${modifierLabels.length > 0
-            ? html`<div class="flex flex-col items-start gap-1 mt-[2px]">
-                ${modifierLabels.map(
-                  (label) =>
-                    html`<span
-                      class="px-2 py-1 rounded text-xs font-bold uppercase tracking-widest bg-malibu-blue text-white shadow-[var(--shadow-malibu-blue-pill)]"
-                      >${label}</span
-                    >`,
-                )}
-              </div>`
-            : html`<div></div>`}
-          <div class="shrink-0">
-            <span
-              class="text-xs font-bold tracking-widest ${timeDisplayUppercase
-                ? "uppercase"
-                : "normal-case"} bg-malibu-blue text-white px-2 py-1 rounded"
-              >${timeDisplay}</span
-            >
-          </div>
-        </div>
-        <!-- Bottom bar: map name + mode, with player count floating above -->
-        <div
-          class="absolute bottom-0 left-0 right-0 flex flex-col px-3 py-2 bg-black/55 backdrop-blur-sm rounded-b-2xl"
-          style="overflow: visible;"
-        >
-          <span
-            class="absolute bottom-full right-2 mb-1 flex items-center gap-1 text-xs font-bold tracking-widest bg-black/70 backdrop-blur-sm px-2 py-0.5 rounded"
-          >
-            ${lobby.numClients}/${lobby.gameConfig?.maxPlayers}
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              class="h-4 w-4 inline-block"
-              viewBox="0 0 20 20"
-              fill="currentColor"
-            >
-              <path
-                d="M13 6a3 3 0 11-6 0 3 3 0 016 0zM18 8a2 2 0 11-4 0 2 2 0 014 0zM14 15a4 4 0 00-8 0v3h8v-3zM6 8a2 2 0 11-4 0 2 2 0 014 0zM16 18v-3a5.972 5.972 0 00-.75-2.906A3.005 3.005 0 0119 15v3h-3zM4.75 12.094A5.973 5.973 0 004 15v3H1v-3a3 3 0 013.75-2.906z"
-              ></path>
-            </svg>
-          </span>
-          ${mapName
-            ? html`<p
-                class="text-sm sm:text-base font-bold uppercase tracking-wider text-left leading-tight"
-              >
-                ${mapName}
-              </p>`
-            : ""}
-          <h3 class="text-xs text-white/70 uppercase tracking-wider text-left">
-            ${titleContent}
-          </h3>
-        </div>
-      </button>
-    `;
+    // Gated, not disabled: `disabled` (which the option below sets, together
+    // with pointer-events-none) swallows the click, and the click is what
+    // makes the update bar wiggle. `blocked` only dims and reports
+    // aria-disabled; validateAndJoin does the refusing.
+    return lobbyCard({
+      lobby,
+      subtitle: titleContent,
+      timeDisplay,
+      timeDisplayUppercase,
+      disabled: !this.inputValid,
+      blocked: shouldBlockMultiplayerAction(
+        this.desktopUpdateState,
+        this.desktopSessionState,
+      ),
+      viewerTrusted: this.viewerTrusted,
+      onClick: () => this.validateAndJoin(lobby),
+    });
   }
 
   private validateAndJoin(lobby: PublicGameInfo) {
+    if (this.blockedByUpdate()) return;
     if (!this.validateUsername()) return;
+    if (!canJoinTrustedLobby(lobby, this.viewerTrusted)) {
+      this.showTrustRequired = true;
+      return;
+    }
 
     this.dispatchEvent(
       new CustomEvent("join-lobby", {

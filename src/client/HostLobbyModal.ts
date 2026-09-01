@@ -22,13 +22,11 @@ import { UserSettings } from "../core/game/UserSettings";
 import {
   ClientInfo,
   GameConfig,
-  GameInfo,
   LobbyInfoEvent,
   TeamCountConfig,
   isValidGameID,
 } from "../core/Schemas";
-import { getUserMe, setLobbyListed } from "./Api";
-import { getPlayToken } from "./Auth";
+import { createLobby, getUserMe, setLobbyListed } from "./Api";
 import "./components/baseComponents/Modal";
 import { BaseModal } from "./components/BaseModal";
 import "./components/ConfirmDialog";
@@ -87,6 +85,8 @@ export class HostLobbyModal extends BaseModal {
   @state() private customAllianceMinutes: number | undefined = undefined;
   @state() private doomsdayClock: boolean = false;
   @state() private doomsdayClockSpeed: DoomsdayClockSpeed = "normal";
+  @state() private overtime: boolean = false;
+  @state() private overtimeStartMinutes: number | undefined = undefined;
   @state() private anonymizeNames: boolean = false;
   @state() private nameReveals: string[] = [];
   @state() private whitelistEnabled: boolean = false;
@@ -143,9 +143,9 @@ export class HostLobbyModal extends BaseModal {
     if (lobby.clients) {
       this.clients = lobby.clients;
     }
-    // The server can delist on its own (join whitelist enabled, duplicate
-    // creator resolved by the master); follow its state unless our own
-    // toggle request is mid-flight.
+    // The server can delist on its own (duplicate creator / cap overflow
+    // resolved by the master); follow its state unless our own toggle
+    // request is mid-flight.
     if (!this.listingRequestInFlight && lobby.listed !== undefined) {
       this.publiclyListed = lobby.listed;
     }
@@ -232,7 +232,9 @@ export class HostLobbyModal extends BaseModal {
 
   // Private/Public segmented toggle in the header. Shown to everyone;
   // non-subscribers get a subscription-required dialog instead of a listing
-  // request (the server re-checks the subscription regardless).
+  // request (the server re-checks the subscription regardless). Listing is
+  // one-way (the server rejects unlisting), so the Private segment goes away
+  // once the lobby is listed.
   private renderVisibilityToggle() {
     const segment = (labelKey: string, isPublic: boolean) => html`
       <button
@@ -249,7 +251,9 @@ export class HostLobbyModal extends BaseModal {
       <div
         class="flex items-center rounded-full border border-white/10 bg-white/5 p-0.5 shrink-0"
       >
-        ${segment("host_modal.visibility_private", false)}
+        ${this.publiclyListed
+          ? nothing
+          : segment("host_modal.visibility_private", false)}
         ${segment("host_modal.visibility_public", true)}
       </div>
       ${this.renderAutoStartTimer()}
@@ -368,6 +372,21 @@ export class HostLobbyModal extends BaseModal {
         .onToggle=${this.handleCustomAlliancesToggle}
         .onInput=${this.handleCustomAllianceMinutesInput}
         .onKeyDown=${this.handleCustomAllianceMinutesKeyDown}
+      ></toggle-input-card>`,
+      html`<toggle-input-card
+        .labelKey=${"game_settings.overtime"}
+        .checked=${this.overtime}
+        .inputMin=${1}
+        .inputMax=${120}
+        .inputStep=${1}
+        .inputValue=${this.overtimeStartMinutes}
+        .inputAriaLabel=${translateText("game_settings.overtime")}
+        .inputPlaceholder=${translateText("game_settings.mins_placeholder")}
+        .defaultInputValue=${30}
+        .minValidOnEnable=${1}
+        .onToggle=${this.handleOvertimeToggle}
+        .onInput=${this.handleOvertimeMinutesInput}
+        .onKeyDown=${this.handleOvertimeMinutesKeyDown}
       ></toggle-input-card>`,
       html`<toggle-input-card
         .labelKey=${"game_settings.gold_multiplier"}
@@ -818,6 +837,8 @@ export class HostLobbyModal extends BaseModal {
     this.customAllianceMinutes = undefined;
     this.doomsdayClock = false;
     this.doomsdayClockSpeed = "normal";
+    this.overtime = false;
+    this.overtimeStartMinutes = undefined;
     this.anonymizeNames = false;
     this.nameReveals = [];
     this.whitelistEnabled = false;
@@ -1000,6 +1021,33 @@ export class HostLobbyModal extends BaseModal {
   ) => {
     this.maxTimer = checked;
     this.maxTimerValue = toOptionalNumber(value);
+    this.putGameConfig();
+  };
+
+  private handleOvertimeToggle = (
+    checked: boolean,
+    value: number | string | undefined,
+  ) => {
+    this.overtime = checked;
+    this.overtimeStartMinutes = toOptionalNumber(value);
+    this.putGameConfig();
+  };
+
+  private handleOvertimeMinutesKeyDown = (e: KeyboardEvent) => {
+    preventDisallowedKeys(e, ["-", "+", "e"]);
+  };
+
+  private handleOvertimeMinutesInput = (e: Event) => {
+    const input = e.target as HTMLInputElement;
+    const value = parseBoundedIntegerFromInput(input, {
+      min: 1,
+      max: 120,
+      stripPattern: /[e+-]/gi,
+    });
+    if (value === undefined) {
+      return;
+    }
+    this.overtimeStartMinutes = value;
     this.putGameConfig();
   };
 
@@ -1370,6 +1418,14 @@ export class HostLobbyModal extends BaseModal {
             doomsdayClock: this.doomsdayClock
               ? { enabled: true, speed: this.doomsdayClockSpeed }
               : { enabled: false },
+            // Same {enabled:false} rule as doomsdayClock above: undefined is
+            // dropped by JSON.stringify, so the toggle could never turn off.
+            overtime: this.overtime
+              ? {
+                  enabled: true,
+                  startMinutes: this.overtimeStartMinutes ?? 30,
+                }
+              : { enabled: false },
             anonymizeNames: this.anonymizeNames,
             nameReveals: this.nameReveals,
             allowedPublicIds: this.whitelistEnabled
@@ -1450,36 +1506,5 @@ export class HostLobbyModal extends BaseModal {
       console.warn("Failed to load nation count", error);
       // Leave existing values unchanged so the UI stays consistent
     }
-  }
-}
-
-async function createLobby(): Promise<GameInfo> {
-  // Send JWT token for creator identification - server extracts persistentID from it
-  // persistentID should never be exposed to other clients
-  const token = await getPlayToken();
-  try {
-    // No worker prefix and no id: nginx (prod) / the vite dev proxy randomly
-    // routes to a worker, which mints a self-owned id and returns it.
-    const response = await fetch(`/api/create_game`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("Server error response:", errorText);
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-    console.log("Success:", data);
-
-    return data as GameInfo;
-  } catch (error) {
-    console.error("Error creating lobby:", error);
-    throw error;
   }
 }

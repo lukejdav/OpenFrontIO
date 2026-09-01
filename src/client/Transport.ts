@@ -1,5 +1,5 @@
 import { ClientEnv } from "src/client/ClientEnv";
-import { z } from "zod";
+import { ZbContext } from "../../zbin";
 import { EventBus, GameEvent } from "../core/EventBus";
 import {
   AllPlayers,
@@ -13,21 +13,28 @@ import { TileRef } from "../core/game/GameMap";
 import {
   AllPlayersStats,
   ClientHashMessage,
+  ClientID,
   ClientIntentMessage,
   ClientJoinMessage,
   ClientMessage,
   ClientPingMessage,
   ClientRejoinMessage,
+  ClientReportMessage,
   ClientSendLiveStatsMessage,
   ClientSendWinnerMessage,
+  ClientSpectateMessage,
   GameConfig,
   Intent,
   LiveStats,
+  ReportReason,
   ServerMessage,
-  ServerMessageSchema,
   Winner,
 } from "../core/Schemas";
-import { replacer } from "../core/Util";
+import {
+  createGameWireContext,
+  decodeServerMessage,
+  encodeClientMessage,
+} from "../core/ZbinWire";
 import { getPlayToken } from "./Auth";
 import { LobbyConfig } from "./ClientGameRunner";
 import { showInGameAlert } from "./InGameModal";
@@ -161,6 +168,17 @@ export class SendWinnerEvent implements GameEvent {
 export class SendLiveStatsEvent implements GameEvent {
   constructor(public readonly stats: LiveStats) {}
 }
+export class SendPlayerReportEvent implements GameEvent {
+  constructor(
+    public readonly reported: ClientID,
+    public readonly reason: ReportReason,
+  ) {}
+}
+// Emitted once a report has actually gone to the server, so the UI only
+// marks a player as reported when it has been.
+export class PlayerReportedEvent implements GameEvent {
+  constructor(public readonly reported: ClientID) {}
+}
 export class SendHashEvent implements GameEvent {
   constructor(
     public readonly tick: Tick,
@@ -193,18 +211,28 @@ export class SendToggleGameStartTimer implements GameEvent {
   constructor() {}
 }
 
+// Switch between playing and watching from the lobby screen.
+export class SendSpectateEvent implements GameEvent {
+  constructor(public readonly spectator: boolean) {}
+}
+
 export class Transport {
   private socket: WebSocket | null = null;
 
   private localServer: LocalServer;
 
-  private buffer: string[] = [];
+  private buffer: ClientMessage[] = [];
 
   private onconnect: () => void;
   private onmessage: (msg: ServerMessage) => void;
 
   private pingInterval: number | null = null;
   public readonly isLocal: boolean;
+
+  // clientID dictionary for the binary wire (see ZbinWire.ts), seeded from
+  // the roster in the start message. Null until the game starts, which is
+  // also the last moment a peer can send a dictionary-encoded field.
+  private zbinCtx: ZbContext | null = null;
 
   constructor(
     private lobbyConfig: LobbyConfig,
@@ -260,6 +288,9 @@ export class Transport {
     this.eventBus.on(PauseGameIntentEvent, (e) => this.onPauseGameIntent(e));
     this.eventBus.on(SendWinnerEvent, (e) => this.onSendWinnerEvent(e));
     this.eventBus.on(SendLiveStatsEvent, (e) => this.onSendLiveStatsEvent(e));
+    this.eventBus.on(SendPlayerReportEvent, (e) =>
+      this.onSendPlayerReportEvent(e),
+    );
     this.eventBus.on(SendHashEvent, (e) => this.onSendHashEvent(e));
     this.eventBus.on(CancelAttackIntentEvent, (e) =>
       this.onCancelAttackIntentEvent(e),
@@ -287,6 +318,13 @@ export class Transport {
     this.eventBus.on(SendToggleGameStartTimer, (e) =>
       this.onSendToggleGameStartTimer(e),
     );
+    this.eventBus.on(SendSpectateEvent, (e) => {
+      this.lobbyConfig.spectator = e.spectator;
+      this.sendMsg({
+        type: "spectate",
+        spectator: e.spectator,
+      } satisfies ClientSpectateMessage);
+    });
   }
 
   private startPing() {
@@ -353,6 +391,8 @@ export class Transport {
     // the desktop app://openfront origin), not window.location.host.
     const workerPath = ClientEnv.workerPath(this.lobbyConfig.gameID);
     this.socket = new WebSocket(`${ClientEnv.serverWsBase()}/${workerPath}`);
+    // Every frame is a zbin payload; without this they would arrive as Blobs.
+    this.socket.binaryType = "arraybuffer";
     this.onconnect = onconnect;
     this.onmessage = onmessage;
     this.socket.onopen = () => {
@@ -368,20 +408,24 @@ export class Transport {
           console.warn("msg is undefined");
           continue;
         }
-        this.socket.send(msg);
+        // Encoded at flush time, not at buffer time: the dictionary may have
+        // been seeded (or reseeded) while the message sat in the buffer.
+        this.socket.send(encodeClientMessage(msg, this.zbinCtx ?? undefined));
       }
       onconnect();
     };
     this.socket.onmessage = (event: MessageEvent) => {
       try {
-        const parsed = JSON.parse(event.data);
-        const result = ServerMessageSchema.safeParse(parsed);
-        if (!result.success) {
-          const error = z.prettifyError(result.error);
-          console.error("Error parsing server message", error);
-          return;
+        const msg = decodeServerMessage(
+          new Uint8Array(event.data as ArrayBuffer),
+          this.zbinCtx ?? undefined,
+        );
+        if (msg.type === "start") {
+          // Seed the dictionary from the same players array, in the same
+          // order, that the server seeded its own from.
+          this.zbinCtx = createGameWireContext(msg.gameStartInfo.players);
         }
-        this.onmessage(result.data);
+        this.onmessage(msg);
       } catch (e) {
         console.error("Error in onmessage handler:", e, event.data);
         return;
@@ -429,6 +473,7 @@ export class Transport {
       cosmetics: this.lobbyConfig.cosmetics,
       turnstileToken: this.lobbyConfig.turnstileToken,
       token: await getPlayToken(),
+      spectator: this.lobbyConfig.spectator,
     } satisfies ClientJoinMessage);
   }
 
@@ -622,6 +667,25 @@ export class Transport {
     }
   }
 
+  private onSendPlayerReportEvent(event: SendPlayerReportEvent) {
+    // Singleplayer records are client-authored and the API ignores their
+    // reports, so there is nowhere for one to go.
+    if (this.isLocal) return;
+    if (this.socket?.readyState !== WebSocket.OPEN) {
+      console.log(
+        "WebSocket is not open, dropping report. Current state:",
+        this.socket?.readyState,
+      );
+      return;
+    }
+    this.sendMsg({
+      type: "report",
+      reported: event.reported,
+      reason: event.reason,
+    } satisfies ClientReportMessage);
+    this.eventBus.emit(new PlayerReportedEvent(event.reported));
+  }
+
   private onSendHashEvent(event: SendHashEvent) {
     if (this.isLocal || this.socket?.readyState === WebSocket.OPEN) {
       this.sendMsg({
@@ -710,17 +774,16 @@ export class Transport {
       // Socket missing, do nothing
       return;
     }
-    const str = JSON.stringify(msg, replacer);
     if (this.socket.readyState === WebSocket.CLOSED) {
       // Buffer message
       console.warn("socket not ready, closing and trying later");
       this.socket.close();
       this.socket = null;
       this.connectRemote(this.onconnect, this.onmessage);
-      this.buffer.push(str);
+      this.buffer.push(msg);
     } else {
       // Send the message directly
-      this.socket.send(str);
+      this.socket.send(encodeClientMessage(msg, this.zbinCtx ?? undefined));
     }
   }
 
